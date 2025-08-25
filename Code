@@ -1,0 +1,419 @@
+.. System architecture
+
+```mermaid
+graph TD
+    A[Presentation Layer] --> B[Business Logic]
+    B --> C[Data Access Layer]
+    C --> D[(Database)]
+    C --> E[External Services]
+```
+
+## Full system code
+
+import sqlite3
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List, Optional
+import logging
+from datetime import datetime, timedelta
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Domain Models ----------
+@dataclass
+class Book:
+    """Domain model representing a book"""
+    isbn: str
+    title: str
+    author: str
+    publication_year: int
+    available: bool = True
+
+    def __post_init__(self):
+        if len(self.isbn) not in [10, 13]:
+            raise ValueError("ISBN must be 10 or 13 characters")
+        if not self.title:
+            raise ValueError("Title cannot be empty")
+        if not self.author:
+            raise ValueError("Author cannot be empty")
+
+@dataclass
+class Patron:
+    """Domain model representing a library patron"""
+    id: str
+    name: str
+    email: str
+    membership_level: str = "standard"
+
+    def __post_init__(self):
+        if not all([self.id, self.name, self.email]):
+            raise ValueError("All patron fields are required")
+
+@dataclass
+class Loan:
+    """Domain model representing a book loan"""
+    book_isbn: str
+    patron_id: str
+    loan_date: datetime
+    due_date: datetime
+    returned: bool = False
+
+# ---------- Data Access Layer ----------
+class DatabaseManager:
+    """Handles all database operations"""
+    def __init__(self, db_name: str = "library.db"):
+        self.conn = sqlite3.connect(db_name)
+        self._initialize_db()
+   
+    def _initialize_db(self):
+        """Initialize database tables"""
+        with self.conn:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS books (
+                    isbn TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    publication_year INTEGER,
+                    available BOOLEAN DEFAULT TRUE
+                );
+               
+                CREATE TABLE IF NOT EXISTS patrons (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    membership_level TEXT
+                );
+               
+                CREATE TABLE IF NOT EXISTS loans (
+                    book_isbn TEXT,
+                    patron_id TEXT,
+                    loan_date TEXT,
+                    due_date TEXT,
+                    returned BOOLEAN DEFAULT FALSE,
+                    FOREIGN KEY(book_isbn) REFERENCES books(isbn),
+                    FOREIGN KEY(patron_id) REFERENCES patrons(id),
+                    PRIMARY KEY(book_isbn, patron_id)
+                );
+               
+                CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+                CREATE INDEX IF NOT EXISTS idx_books_author ON books(author);
+                CREATE INDEX IF NOT EXISTS idx_loans_due_date ON loans(due_date);
+            """)
+   
+    def execute_query(self, query: str, params: tuple = (), fetch: bool = False):
+        """Generic query executor"""
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        if fetch:
+            return cursor.fetchall()
+        self.conn.commit()
+       
+    def __del__(self):
+        self.conn.close()
+
+# ---------- Repository Pattern ----------
+class IRepository(ABC):
+    @abstractmethod
+    def add(self, entity):
+        pass
+   
+    @abstractmethod
+    def get(self, identifier):
+        pass
+   
+    @abstractmethod
+    def get_all(self):
+        pass
+   
+    @abstractmethod
+    def update(self, entity):
+        pass
+   
+    @abstractmethod
+    def delete(self, identifier):
+        pass
+
+class BookRepository(IRepository):
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+   
+    def add(self, book: Book):
+        query = """
+            INSERT INTO books (isbn, title, author, publication_year, available)
+            VALUES (?, ?, ?, ?, ?)
+        """
+        self.db.execute_query(query, (
+            book.isbn,
+            book.title,
+            book.author,
+            book.publication_year,
+            book.available
+        ))
+        logger.info(f"Added book: {book.isbn}")
+   
+    def get(self, isbn: str) -> Optional[Book]:
+        query = "SELECT * FROM books WHERE isbn = ?"
+        result = self.db.execute_query(query, (isbn,), fetch=True)
+        if result:
+            return Book(*result[0])
+        return None
+   
+    def get_all(self) -> List[Book]:
+        query = "SELECT * FROM books"
+        results = self.db.execute_query(query, fetch=True)
+        return [Book(*r) for r in results]
+   
+    def update(self, book: Book):
+        query = """
+            UPDATE books
+            SET title = ?, author = ?, publication_year = ?, available = ?
+            WHERE isbn = ?
+        """
+        self.db.execute_query(query, (
+            book.title, book.author, book.publication_year,
+            book.available, book.isbn
+        ))
+        logger.info(f"Updated book: {book.isbn}")
+   
+    def delete(self, isbn: str):
+        query = "DELETE FROM books WHERE isbn = ?"
+        self.db.execute_query(query, (isbn,))
+        logger.info(f"Deleted book: {isbn}")
+   
+    def search(self, title: str = None, author: str = None) -> List[Book]:
+        if not any([title, author]):
+            return []
+           
+        query = "SELECT * FROM books WHERE 1=1"
+        params = []
+       
+        if title:
+            query += " AND title LIKE ?"
+            params.append(f"%{title}%")
+        if author:
+            query += " AND author LIKE ?"
+            params.append(f"%{author}%")
+           
+        results = self.db.execute_query(query, tuple(params), fetch=True)
+        return [Book(*r) for r in results]
+   
+    def get_available_books(self) -> List[Book]:
+        query = "SELECT * FROM books WHERE available = TRUE"
+        results = self.db.execute_query(query, fetch=True)
+        return [Book(*r) for r in results]
+
+# ---------- Business Logic Layer ----------
+class LibraryService:
+    """Core business logic for library operations"""
+    def __init__(self, book_repo: BookRepository):
+        self.book_repo = book_repo
+   
+    def add_book_to_catalog(self, book: Book) -> bool:
+        try:
+            self.book_repo.add(book)
+            return True
+        except Exception as e:
+            logger.error(f"Error adding book: {str(e)}")
+            return False
+   
+    def remove_book_from_catalog(self, isbn: str) -> bool:
+        try:
+            self.book_repo.delete(isbn)
+            return True
+        except Exception as e:
+            logger.error(f"Error removing book: {str(e)}")
+            return False
+   
+    def search_books(self, title: str = None, author: str = None) -> List[Book]:
+        try:
+            return self.book_repo.search(title, author)
+        except Exception as e:
+            logger.error(f"Error searching books: {str(e)}")
+            return []
+   
+    def get_all_books(self, available_only: bool = False) -> List[Book]:
+        try:
+            if available_only:
+                return self.book_repo.get_available_books()
+            return self.book_repo.get_all()
+        except Exception as e:
+            logger.error(f"Error getting books: {str(e)}")
+            return []
+   
+    def borrow_book(self, isbn: str, patron_id: str) -> bool:
+        try:
+            book = self.book_repo.get(isbn)
+            if not book or not book.available:
+                return False
+               
+            book.available = False
+            self.book_repo.update(book)
+           
+            loan_date = datetime.now()
+            due_date = loan_date + timedelta(days=14)
+           
+            query = """
+                INSERT INTO loans (book_isbn, patron_id, loan_date, due_date)
+                VALUES (?, ?, ?, ?)
+            """
+            self.book_repo.db.execute_query(query, (
+                isbn, patron_id,
+                loan_date.isoformat(),
+                due_date.isoformat()
+            ))
+            return True
+        except Exception as e:
+            logger.error(f"Error borrowing book: {str(e)}")
+            return False
+   
+    def return_book(self, isbn: str, patron_id: str) -> bool:
+        try:
+            book = self.book_repo.get(isbn)
+            if not book:
+                return False
+               
+            book.available = True
+            self.book_repo.update(book)
+           
+            query = """
+                UPDATE loans
+                SET returned = TRUE
+                WHERE book_isbn = ? AND patron_id = ?
+            """
+            self.book_repo.db.execute_query(query, (isbn, patron_id))
+            return True
+        except Exception as e:
+            logger.error(f"Error returning book: {str(e)}")
+            return False
+
+# ---------- Presentation Layer ----------
+class CLIInterface:
+    """Command line interface for the library system"""
+    def __init__(self):
+        db_manager = DatabaseManager()
+        book_repo = BookRepository(db_manager)
+        self.service = LibraryService(book_repo)
+   
+    def display_menu(self):
+        print("\n===== Library Management System =====")
+        print("1. Add Book")
+        print("2. Remove Book")
+        print("3. Search Books")
+        print("4. List All Books")
+        print("5. Borrow Book")
+        print("6. Return Book")
+        print("7. Exit")
+        return input("Enter your choice (1-7): ")
+   
+    def run(self):
+        while True:
+            choice = self.display_menu()
+           
+            if choice == '1':
+                self._add_book_flow()
+            elif choice == '2':
+                self._remove_book_flow()
+            elif choice == '3':
+                self._search_books_flow()
+            elif choice == '4':
+                self._list_books_flow()
+            elif choice == '5':
+                self._borrow_book_flow()
+            elif choice == '6':
+                self._return_book_flow()
+            elif choice == '7':
+                print("Exiting the system. Goodbye!")
+                break
+            else:
+                print("Invalid choice. Please try again.")
+   
+    def _add_book_flow(self):
+        print("\n=== Add New Book ===")
+        try:
+            isbn = input("Enter ISBN (10 or 13 digits): ").strip()
+            title = input("Enter book title: ").strip()
+            author = input("Enter author name: ").strip()
+            year = int(input("Enter publication year: "))
+           
+            book = Book(isbn, title, author, year)
+            if self.service.add_book_to_catalog(book):
+                print("Book added successfully!")
+            else:
+                print("Failed to add book.")
+        except ValueError as e:
+            print(f"Error: {str(e)}")
+   
+    def _remove_book_flow(self):
+        print("\n=== Remove Book ===")
+        isbn = input("Enter ISBN of book to remove: ").strip()
+        if self.service.remove_book_from_catalog(isbn):
+            print("Book removed successfully!")
+        else:
+            print("Failed to remove book.")
+   
+    def _search_books_flow(self):
+        print("\n=== Search Books ===")
+        title = input("Enter title to search (leave blank to skip): ").strip()
+        author = input("Enter author to search (leave blank to skip): ").strip()
+       
+        if not any([title, author]):
+            print("Please provide at least one search criteria")
+            return
+           
+        results = self.service.search_books(title, author)
+        if results:
+            print("\nSearch Results:")
+            for book in results:
+                status = "Available" if book.available else "Checked Out"
+                print(f"{book.title} by {book.author} ({book.isbn}) - {status}")
+        else:
+            print("No matching books found.")
+   
+    def _list_books_flow(self):
+        print("\n=== All Books ===")
+        show_all = input("Show all books? (y/n): ").lower() == 'y'
+        books = self.service.get_all_books(not show_all)
+       
+        if books:
+            for book in books:
+                status = "Available" if book.available else "Checked Out"
+                print(f"{book.title} by {book.author} ({book.isbn}) - {status}")
+        else:
+            print("No books found in the library.")
+   
+    def _borrow_book_flow(self):
+        print("\n=== Borrow Book ===")
+        isbn = input("Enter ISBN of book to borrow: ").strip()
+        patron_id = input("Enter your patron ID: ").strip()
+       
+        if self.service.borrow_book(isbn, patron_id):
+            print("Book borrowed successfully!")
+        else:
+            print("Failed to borrow book (might be unavailable or not found).")
+   
+    def _return_book_flow(self):
+        print("\n=== Return Book ===")
+        isbn = input("Enter ISBN of book to return: ").strip()
+        patron_id = input("Enter your patron ID: ").strip()
+       
+        if self.service.return_book(isbn, patron_id):
+            print("Book returned successfully!")
+        else:
+            print("Failed to return book.")
+
+# ---------- Application Entry Point ----------
+if __name__ == "__main__":
+    try:
+        app = CLIInterface()
+        app.run()
+    except KeyboardInterrupt:
+        print("\nApplication terminated by user.")
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {str(e)}")
+        print("A critical error occurred. Please check logs.")
+```
